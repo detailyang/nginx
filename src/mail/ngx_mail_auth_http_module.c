@@ -985,21 +985,6 @@ ngx_mail_auth_http_parse_header_line(ngx_mail_session_t *s,
                 break;
             }
 
-            if (ch == CR) {
-                ctx->header_name_end = p;
-                ctx->header_start = p;
-                ctx->header_end = p;
-                state = sw_almost_done;
-                break;
-            }
-
-            if (ch == LF) {
-                ctx->header_name_end = p;
-                ctx->header_start = p;
-                ctx->header_end = p;
-                goto done;
-            }
-
             return NGX_ERROR;
 
         /* space* before header value */
@@ -1321,11 +1306,14 @@ ngx_mail_auth_http_create_request(ngx_mail_session_t *s, ngx_pool_t *pool,
     b->last = ngx_copy(b->last, passwd.data, passwd.len);
     *b->last++ = CR; *b->last++ = LF;
 
-    if (s->auth_method != NGX_MAIL_AUTH_PLAIN && s->salt.len) {
+    if ((s->auth_method == NGX_MAIL_AUTH_APOP
+         || s->auth_method == NGX_MAIL_AUTH_CRAM_MD5)
+        && s->salt.len)
+    {
         b->last = ngx_cpymem(b->last, "Auth-Salt: ", sizeof("Auth-Salt: ") - 1);
         b->last = ngx_copy(b->last, s->salt.data, s->salt.len);
 
-        s->passwd.data = NULL;
+        ngx_str_null(&s->passwd);
     }
 
     b->last = ngx_cpymem(b->last, "Auth-Protocol: ",

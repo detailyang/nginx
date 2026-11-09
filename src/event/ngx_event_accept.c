@@ -180,28 +180,31 @@ ngx_event_accept(ngx_event_t *ev)
             return;
         }
 
-        /* set a blocking mode for iocp and non-blocking mode for others */
-
-        if (ngx_inherited_nonblocking) {
-            if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-                if (ngx_blocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_blocking_n " failed");
-                    ngx_close_accepted_connection(c);
-                    return;
-                }
-            }
-
-        } else {
-            if (!(ngx_event_flags & NGX_USE_IOCP_EVENT)) {
-                if (ngx_nonblocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_nonblocking_n " failed");
-                    ngx_close_accepted_connection(c);
-                    return;
-                }
+        if (!ngx_inherited_nonblocking) {
+            if (ngx_nonblocking(s) == -1) {
+                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
+                              ngx_nonblocking_n " failed");
+                ngx_close_accepted_connection(c);
+                return;
             }
         }
+
+#if (NGX_HAVE_KEEPALIVE_TUNABLE && NGX_DARWIN)
+
+        /* Darwin doesn't inherit TCP_KEEPALIVE from a listening socket */
+
+        if (ls->keepidle) {
+            if (setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE,
+                           (const void *) &ls->keepidle, sizeof(int))
+                == -1)
+            {
+                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
+                              "setsockopt(TCP_KEEPALIVE, %d) failed, ignored",
+                              ls->keepidle);
+            }
+        }
+
+#endif
 
         *log = ls->log;
 
@@ -233,10 +236,6 @@ ngx_event_accept(ngx_event_t *ev)
         wev = c->write;
 
         wev->ready = 1;
-
-        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-            rev->ready = 1;
-        }
 
         if (ev->deferred_accept) {
             rev->ready = 1;

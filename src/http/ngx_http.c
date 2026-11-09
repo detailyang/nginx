@@ -72,6 +72,7 @@ ngx_uint_t   ngx_http_max_module;
 
 
 ngx_http_output_header_filter_pt  ngx_http_top_header_filter;
+ngx_http_output_header_filter_pt  ngx_http_top_early_hints_filter;
 ngx_http_output_body_filter_pt    ngx_http_top_body_filter;
 ngx_http_request_body_filter_pt   ngx_http_top_request_body_filter;
 
@@ -670,8 +671,8 @@ static ngx_int_t
 ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     ngx_http_core_loc_conf_t *pclcf)
 {
-    ngx_uint_t                   n;
-    ngx_queue_t                 *q, *locations, *named, tail;
+    ngx_uint_t                   n, p;
+    ngx_queue_t                 *q, *locations, *named, *predicate, tail;
     ngx_http_core_loc_conf_t    *clcf;
     ngx_http_location_queue_t   *lq;
     ngx_http_core_loc_conf_t   **clcfp;
@@ -694,6 +695,8 @@ ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     regex = NULL;
     r = 0;
 #endif
+    predicate = NULL;
+    p = 0;
 
     for (q = ngx_queue_head(locations);
          q != ngx_queue_sentinel(locations);
@@ -720,6 +723,16 @@ ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
         }
 
 #endif
+
+        if (clcf->predicate) {
+            p++;
+
+            if (predicate == NULL) {
+                predicate = q;
+            }
+
+            continue;
+        }
 
         if (clcf->named) {
             n++;
@@ -763,6 +776,29 @@ ngx_http_init_locations(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
         ngx_queue_split(locations, named, &tail);
     }
 
+    if (predicate) {
+        clcfp = ngx_palloc(cf->pool,
+                           (p + 1) * sizeof(ngx_http_core_loc_conf_t *));
+        if (clcfp == NULL) {
+            return NGX_ERROR;
+        }
+
+        pclcf->predicate_locations = clcfp;
+
+        for (q = predicate;
+             q != ngx_queue_sentinel(locations);
+             q = ngx_queue_next(q))
+        {
+            lq = (ngx_http_location_queue_t *) q;
+
+            *(clcfp++) = lq->exact;
+        }
+
+        *clcfp = NULL;
+
+        ngx_queue_split(locations, predicate, &tail);
+    }
+
 #if (NGX_PCRE)
 
     if (regex) {
@@ -800,8 +836,16 @@ ngx_http_init_static_location_trees(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t *pclcf)
 {
     ngx_queue_t                *q, *locations;
-    ngx_http_core_loc_conf_t   *clcf;
+    ngx_http_core_loc_conf_t   *clcf, **clcfp;
     ngx_http_location_queue_t  *lq;
+
+    if (pclcf->predicate_locations) {
+        for (clcfp = pclcf->predicate_locations; *clcfp; clcfp++) {
+            if (ngx_http_init_static_location_trees(cf, *clcfp) != NGX_OK) {
+                return NGX_ERROR;
+            }
+        }
+    }
 
     locations = pclcf->locations;
 
@@ -866,7 +910,7 @@ ngx_http_add_location(ngx_conf_t *cf, ngx_queue_t **locations,
 #if (NGX_PCRE)
         || clcf->regex
 #endif
-        || clcf->named || clcf->noname)
+        || clcf->predicate || clcf->named || clcf->noname)
     {
         lq->exact = clcf;
         lq->inclusive = NULL;
@@ -963,6 +1007,21 @@ ngx_http_cmp_locations(const ngx_queue_t *one, const ngx_queue_t *two)
 
     if (first->named && second->named) {
         return ngx_strcmp(first->name.data, second->name.data);
+    }
+
+    if (first->predicate && !second->predicate) {
+        /* shift predicate locations to the end */
+        return 1;
+    }
+
+    if (!first->predicate && second->predicate) {
+        /* shift predicate locations to the end */
+        return -1;
+    }
+
+    if (first->predicate || second->predicate) {
+        /* do not sort the predicate locations */
+        return 0;
     }
 
 #if (NGX_PCRE)
@@ -1130,7 +1189,7 @@ ngx_http_create_locations_tree(ngx_conf_t *cf, ngx_queue_t *locations,
     node->auto_redirect = (u_char) ((lq->exact && lq->exact->auto_redirect)
                            || (lq->inclusive && lq->inclusive->auto_redirect));
 
-    node->len = (u_char) len;
+    node->len = (u_short) len;
     ngx_memcpy(node->name, &lq->name->data[prefix], len);
 
     ngx_queue_split(locations, q, &tail);
@@ -1200,7 +1259,10 @@ ngx_http_add_listen(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     port = cmcf->ports->elts;
     for (i = 0; i < cmcf->ports->nelts; i++) {
 
-        if (p != port[i].port || sa->sa_family != port[i].family) {
+        if (p != port[i].port
+            || lsopt->type != port[i].type
+            || sa->sa_family != port[i].family)
+        {
             continue;
         }
 
@@ -1217,6 +1279,7 @@ ngx_http_add_listen(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     }
 
     port->family = sa->sa_family;
+    port->type = lsopt->type;
     port->port = p;
     port->addrs.elts = NULL;
 
@@ -1228,13 +1291,17 @@ static ngx_int_t
 ngx_http_add_addresses(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     ngx_http_conf_port_t *port, ngx_http_listen_opt_t *lsopt)
 {
-    ngx_uint_t             i, default_server, proxy_protocol;
+    ngx_uint_t             i, default_server, proxy_protocol,
+                           protocols, protocols_prev;
     ngx_http_conf_addr_t  *addr;
 #if (NGX_HTTP_SSL)
     ngx_uint_t             ssl;
 #endif
 #if (NGX_HTTP_V2)
     ngx_uint_t             http2;
+#endif
+#if (NGX_HTTP_V3)
+    ngx_uint_t             quic;
 #endif
 
     /*
@@ -1264,12 +1331,21 @@ ngx_http_add_addresses(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
         default_server = addr[i].opt.default_server;
 
         proxy_protocol = lsopt->proxy_protocol || addr[i].opt.proxy_protocol;
+        protocols = lsopt->proxy_protocol;
+        protocols_prev = addr[i].opt.proxy_protocol;
 
 #if (NGX_HTTP_SSL)
         ssl = lsopt->ssl || addr[i].opt.ssl;
+        protocols |= lsopt->ssl << 1;
+        protocols_prev |= addr[i].opt.ssl << 1;
 #endif
 #if (NGX_HTTP_V2)
         http2 = lsopt->http2 || addr[i].opt.http2;
+        protocols |= lsopt->http2 << 2;
+        protocols_prev |= addr[i].opt.http2 << 2;
+#endif
+#if (NGX_HTTP_V3)
+        quic = lsopt->quic || addr[i].opt.quic;
 #endif
 
         if (lsopt->set) {
@@ -1299,6 +1375,57 @@ ngx_http_add_addresses(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
             addr[i].default_server = cscf;
         }
 
+        /* check for conflicting protocol options */
+
+        if ((protocols | protocols_prev) != protocols_prev) {
+
+            /* options added */
+
+            if ((addr[i].opt.set && !lsopt->set)
+                || addr[i].protocols_changed
+                || (protocols | protocols_prev) != protocols)
+            {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "protocol options redefined for %V",
+                                   &addr[i].opt.addr_text);
+            }
+
+            addr[i].protocols = protocols_prev;
+            addr[i].protocols_set = 1;
+            addr[i].protocols_changed = 1;
+
+        } else if ((protocols_prev | protocols) != protocols) {
+
+            /* options removed */
+
+            if (lsopt->set
+                || (addr[i].protocols_set && protocols != addr[i].protocols))
+            {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "protocol options redefined for %V",
+                                   &addr[i].opt.addr_text);
+            }
+
+            addr[i].protocols = protocols;
+            addr[i].protocols_set = 1;
+            addr[i].protocols_changed = 1;
+
+        } else {
+
+            /* the same options */
+
+            if ((lsopt->set && addr[i].protocols_changed)
+                || (addr[i].protocols_set && protocols != addr[i].protocols))
+            {
+                ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                                   "protocol options redefined for %V",
+                                   &addr[i].opt.addr_text);
+            }
+
+            addr[i].protocols = protocols;
+            addr[i].protocols_set = 1;
+        }
+
         addr[i].opt.default_server = default_server;
         addr[i].opt.proxy_protocol = proxy_protocol;
 #if (NGX_HTTP_SSL)
@@ -1306,6 +1433,9 @@ ngx_http_add_addresses(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
 #endif
 #if (NGX_HTTP_V2)
         addr[i].opt.http2 = http2;
+#endif
+#if (NGX_HTTP_V3)
+        addr[i].opt.quic = quic;
 #endif
 
         return NGX_OK;
@@ -1355,6 +1485,9 @@ ngx_http_add_address(ngx_conf_t *cf, ngx_http_core_srv_conf_t *cscf,
     }
 
     addr->opt = *lsopt;
+    addr->protocols = 0;
+    addr->protocols_set = 0;
+    addr->protocols_changed = 0;
     addr->hash.buckets = NULL;
     addr->hash.size = 0;
     addr->wc_head = NULL;
@@ -1757,19 +1890,8 @@ ngx_http_add_listening(ngx_conf_t *cf, ngx_http_conf_addr_t *addr)
     ls->log.data = &ls->addr_text;
     ls->log.handler = ngx_accept_log_error;
 
-#if (NGX_WIN32)
-    {
-    ngx_iocp_conf_t  *iocpcf = NULL;
-
-    if (ngx_get_conf(cf->cycle->conf_ctx, ngx_events_module)) {
-        iocpcf = ngx_event_get_conf(cf->cycle->conf_ctx, ngx_iocp_module);
-    }
-    if (iocpcf && iocpcf->acceptex_read) {
-        ls->post_accept_buffer_size = cscf->client_header_buffer_size;
-    }
-    }
-#endif
-
+    ls->type = addr->opt.type;
+    ls->protocol = addr->opt.protocol;
     ls->backlog = addr->opt.backlog;
     ls->rcvbuf = addr->opt.rcvbuf;
     ls->sndbuf = addr->opt.sndbuf;
@@ -1805,6 +1927,12 @@ ngx_http_add_listening(ngx_conf_t *cf, ngx_http_conf_addr_t *addr)
     ls->reuseport = addr->opt.reuseport;
 #endif
 
+    ls->wildcard = addr->opt.wildcard;
+
+#if (NGX_HTTP_V3)
+    ls->quic = addr->opt.quic;
+#endif
+
     return ls;
 }
 
@@ -1836,6 +1964,9 @@ ngx_http_add_addrs(ngx_conf_t *cf, ngx_http_port_t *hport,
 #endif
 #if (NGX_HTTP_V2)
         addrs[i].conf.http2 = addr[i].opt.http2;
+#endif
+#if (NGX_HTTP_V3)
+        addrs[i].conf.quic = addr[i].opt.quic;
 #endif
         addrs[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
 
@@ -1901,6 +2032,9 @@ ngx_http_add_addrs6(ngx_conf_t *cf, ngx_http_port_t *hport,
 #endif
 #if (NGX_HTTP_V2)
         addrs6[i].conf.http2 = addr[i].opt.http2;
+#endif
+#if (NGX_HTTP_V3)
+        addrs6[i].conf.quic = addr[i].opt.quic;
 #endif
         addrs6[i].conf.proxy_protocol = addr[i].opt.proxy_protocol;
 

@@ -29,11 +29,7 @@
 #define NGX_MODULE_SIGNATURE_1   "0"
 #endif
 
-#if (NGX_HAVE_IOCP)
-#define NGX_MODULE_SIGNATURE_2   "1"
-#else
 #define NGX_MODULE_SIGNATURE_2   "0"
-#endif
 
 #if (NGX_HAVE_FILE_AIO || NGX_COMPAT)
 #define NGX_MODULE_SIGNATURE_3   "1"
@@ -107,7 +103,12 @@
 #endif
 
 #define NGX_MODULE_SIGNATURE_17  "0"
+
+#if (NGX_QUIC || NGX_COMPAT)
+#define NGX_MODULE_SIGNATURE_18  "1"
+#else
 #define NGX_MODULE_SIGNATURE_18  "0"
+#endif
 
 #if (NGX_HAVE_OPENAT)
 #define NGX_MODULE_SIGNATURE_19  "1"

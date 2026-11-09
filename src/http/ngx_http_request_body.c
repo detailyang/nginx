@@ -92,6 +92,13 @@ ngx_http_read_client_request_body(ngx_http_request_t *r,
     }
 #endif
 
+#if (NGX_HTTP_V3)
+    if (r->http_version == NGX_HTTP_VERSION_30) {
+        rc = ngx_http_v3_read_request_body(r);
+        goto done;
+    }
+#endif
+
     preread = r->header_in->last - r->header_in->pos;
 
     if (preread) {
@@ -229,6 +236,18 @@ ngx_http_read_unbuffered_request_body(ngx_http_request_t *r)
 #if (NGX_HTTP_V2)
     if (r->stream) {
         rc = ngx_http_v2_read_unbuffered_request_body(r);
+
+        if (rc == NGX_OK) {
+            r->reading_body = 0;
+        }
+
+        return rc;
+    }
+#endif
+
+#if (NGX_HTTP_V3)
+    if (r->http_version == NGX_HTTP_VERSION_30) {
+        rc = ngx_http_v3_read_unbuffered_request_body(r);
 
         if (rc == NGX_OK) {
             r->reading_body = 0;
@@ -562,7 +581,9 @@ ngx_http_write_request_body(ngx_http_request_t *r)
 
         rb->temp_file = tf;
 
-        if (rb->bufs == NULL) {
+        if (rb->bufs == NULL
+            || (!ngx_buf_in_memory(rb->bufs->buf) && rb->bufs->buf->last_buf))
+        {
             /* empty body with r->request_body_in_file_only */
 
             if (ngx_create_temp_file(&tf->file, tf->path, tf->pool,
@@ -621,6 +642,12 @@ ngx_http_discard_request_body(ngx_http_request_t *r)
 #if (NGX_HTTP_V2)
     if (r->stream) {
         r->stream->skip_data = 1;
+        return NGX_OK;
+    }
+#endif
+
+#if (NGX_HTTP_V3)
+    if (r->http_version == NGX_HTTP_VERSION_30) {
         return NGX_OK;
     }
 #endif
@@ -845,7 +872,7 @@ ngx_http_discard_request_body_filter(ngx_http_request_t *r, ngx_buf_t *b)
 
         for ( ;; ) {
 
-            rc = ngx_http_parse_chunked(r, b, rb->chunked);
+            rc = ngx_http_parse_chunked(r, b, rb->chunked, 0);
 
             if (rc == NGX_OK) {
 
@@ -920,6 +947,9 @@ ngx_http_test_expect(ngx_http_request_t *r)
         || r->http_version < NGX_HTTP_VERSION_11
 #if (NGX_HTTP_V2)
         || r->stream != NULL
+#endif
+#if (NGX_HTTP_V3)
+        || r->connection->quic != NULL
 #endif
        )
     {
@@ -1060,6 +1090,7 @@ static ngx_int_t
 ngx_http_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
     size_t                     size;
+    u_char                    *p;
     ngx_int_t                  rc;
     ngx_buf_t                 *b;
     ngx_chain_t               *cl, *out, *tl, **ll;
@@ -1091,6 +1122,7 @@ ngx_http_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
     for (cl = in; cl; cl = cl->next) {
 
         b = NULL;
+        p = cl->buf->pos;
 
         for ( ;; ) {
 
@@ -1103,7 +1135,7 @@ ngx_http_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
                            cl->buf->file_pos,
                            cl->buf->file_last - cl->buf->file_pos);
 
-            rc = ngx_http_parse_chunked(r, cl->buf, rb->chunked);
+            rc = ngx_http_parse_chunked(r, cl->buf, rb->chunked, 0);
 
             if (rc == NGX_OK) {
 
@@ -1226,6 +1258,18 @@ ngx_http_request_body_chunked_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                           "client sent invalid chunked body");
+
+            return NGX_HTTP_BAD_REQUEST;
+        }
+
+        rb->received += cl->buf->pos - p;
+
+        if (rb->received / 8 > r->headers_in.content_length_n + 1048576) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "client sent too large chunked body "
+                          "overhead: %O+%O bytes",
+                          r->headers_in.content_length_n,
+                          rb->received - r->headers_in.content_length_n);
 
             return NGX_HTTP_BAD_REQUEST;
         }

@@ -267,6 +267,18 @@ ngx_process_events_and_timers(ngx_cycle_t *cycle)
 ngx_int_t
 ngx_handle_read_event(ngx_event_t *rev, ngx_uint_t flags)
 {
+#if (NGX_QUIC)
+
+    ngx_connection_t  *c;
+
+    c = rev->data;
+
+    if (c->quic) {
+        return NGX_OK;
+    }
+
+#endif
+
     if (ngx_event_flags & NGX_USE_CLEAR_EVENT) {
 
         /* kqueue, epoll */
@@ -326,8 +338,6 @@ ngx_handle_read_event(ngx_event_t *rev, ngx_uint_t flags)
         }
     }
 
-    /* iocp */
-
     return NGX_OK;
 }
 
@@ -337,9 +347,15 @@ ngx_handle_write_event(ngx_event_t *wev, size_t lowat)
 {
     ngx_connection_t  *c;
 
-    if (lowat) {
-        c = wev->data;
+    c = wev->data;
 
+#if (NGX_QUIC)
+    if (c->quic) {
+        return NGX_OK;
+    }
+#endif
+
+    if (lowat) {
         if (ngx_send_lowat(c, lowat) == NGX_ERROR) {
             return NGX_ERROR;
         }
@@ -404,8 +420,6 @@ ngx_handle_write_event(ngx_event_t *wev, size_t lowat)
             return NGX_OK;
         }
     }
-
-    /* iocp */
 
     return NGX_OK;
 }
@@ -813,9 +827,7 @@ ngx_event_process_init(ngx_cycle_t *cycle)
         rev->deferred_accept = ls[i].deferred_accept;
 #endif
 
-        if (!(ngx_event_flags & NGX_USE_IOCP_EVENT)
-            && cycle->old_cycle)
-        {
+        if (cycle->old_cycle) {
             if (ls[i].previous) {
 
                 /*
@@ -837,44 +849,28 @@ ngx_event_process_init(ngx_cycle_t *cycle)
 
 #if (NGX_WIN32)
 
-        if (ngx_event_flags & NGX_USE_IOCP_EVENT) {
-            ngx_iocp_conf_t  *iocpcf;
+        rev->handler = ngx_event_accept;
 
-            rev->handler = ngx_event_acceptex;
+        if (ngx_use_accept_mutex) {
+            continue;
+        }
 
-            if (ngx_use_accept_mutex) {
-                continue;
-            }
-
-            if (ngx_add_event(rev, 0, NGX_IOCP_ACCEPT) == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-
-            ls[i].log.handler = ngx_acceptex_log_error;
-
-            iocpcf = ngx_event_get_conf(cycle->conf_ctx, ngx_iocp_module);
-            if (ngx_event_post_acceptex(&ls[i], iocpcf->post_acceptex)
-                == NGX_ERROR)
-            {
-                return NGX_ERROR;
-            }
-
-        } else {
-            rev->handler = ngx_event_accept;
-
-            if (ngx_use_accept_mutex) {
-                continue;
-            }
-
-            if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
-                return NGX_ERROR;
-            }
+        if (ngx_add_event(rev, NGX_READ_EVENT, 0) == NGX_ERROR) {
+            return NGX_ERROR;
         }
 
 #else
 
-        rev->handler = (c->type == SOCK_STREAM) ? ngx_event_accept
-                                                : ngx_event_recvmsg;
+        if (c->type == SOCK_STREAM) {
+            rev->handler = ngx_event_accept;
+
+#if (NGX_QUIC)
+        } else if (ls[i].quic) {
+            rev->handler = ngx_quic_recvmsg;
+#endif
+        } else {
+            rev->handler = ngx_event_recvmsg;
+        }
 
 #if (NGX_HAVE_REUSEPORT)
 
